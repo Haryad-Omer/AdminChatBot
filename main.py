@@ -17,8 +17,10 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://ikmuklqzxxpsggxgklph.supa
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_G4Ad6UbE5foWG0n2CTl6EA_vsiBHHpR")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "Admin626")
 RECOVERY_TOKEN = os.environ.get("RECOVERY_TOKEN", "")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "google/gemini-2.0-flash-lite")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
+
+# هێشتنەوەی هەموو شتێک لەسەر Gemini وەک داواکاریت
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "google/gemini-3.1-flash-lite")
 
 app = FastAPI()
 
