@@ -1,27 +1,49 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
-import requests, json
+from pydantic import BaseModel
+import httpx, json, os, secrets
+
+# --- Graceful slowapi import (rate limiting) ---
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    RATE_LIMIT_ENABLED = True
+except ImportError:
+    RATE_LIMIT_ENABLED = False
+
+# --- CONFIG: All credentials from Environment Variables ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://ikmuklqzxxpsggxgklph.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_G4Ad6UbE5foWG0n2CTl6EA_vsiBHHpR")
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "Admin626")
+RECOVERY_TOKEN = os.environ.get("RECOVERY_TOKEN", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "google/gemini-2.0-flash-lite")
 
 app = FastAPI()
 
-# --- 🌐 CORS ---
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- 🔑 CONFIG ---
-SUPABASE_URL = "https://ikmuklqzxxpsggxgklph.supabase.co" 
-SUPABASE_KEY = "sb_publishable_G4Ad6UbE5foWG0n2CTl6EA_vsiBHHpR" 
-ADMIN_SECRET = "Admin626"
-OPENROUTER_API_KEY = "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" 
-GEMINI_MODEL = "google/gemini-2.0-flash-001" 
+if RATE_LIMIT_ENABLED:
+    limiter = Limiter(key_func=get_remote_address)
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+else:
+    class _DummyLimiter:
+        def limit(self, *a, **kw):
+            def decorator(f): return f
+            return decorator
+    limiter = _DummyLimiter()
 
-# --- 🎭 PERSONAS (هەر ٦ کەسایەتییەکە بە بنچینەیی) ---
+ALLOWED_EXPERTS = {"brain", "trans", "calc", "content", "report", "finder"}
+
 PROMPTS = {
     "brain": "تۆ ناوت (مێشکی بازرگانی)یە. تۆ ڕاوێژکاری سەرەکی بزنس و ستراتیژییەتیت.\nئەرکەکانت:\n١. وەڵامدانەوەی پرسیارە گشتییەکانی بازرگانی و ئیدارە.\n٢. ڕوونکردنەوەی پلانی بازرگانی و گەشەپێدان.\n٣. هەمیشە بە کوردی و بە شێوازێکی پرۆفیشناڵ و هاندەر وەڵام بدەرەوە.",
     "trans": "تۆ ناوت (وەرگێڕی بازرگانی)یە. ئەرکی تۆ تەنها وەرگێڕانە بۆ زمانی کوردی.\nئەرکەکانت:\n١. هەر دەقێک (ئینگلیزی یان چینی)ت بۆ هات، بیکە بە کوردییەکی پاراو و بازرگانی.\n٢. زاراوە بازرگانییەکان (وەک FOB, CIF, MOQ) بە کوردی ڕوون بکەرەوە.\n٣. هیچ قسەی زیادە مەکە، تەنها وەرگێڕانەکە ئەنجام بدە.",
@@ -31,8 +53,18 @@ PROMPTS = {
     "finder": "تۆ ناوت (دۆزەرەوەی بەرهەم)ە. تۆ پسپۆڕی دۆزینەوەی بەرهەمی براوەیت (Winning Products).\nئەرکەکانت:\n١. پێدانی بیرۆکەی بەرهەمی نوێ بۆ فرۆشتن.\n٢. شیکردنەوەی ئەوەی بۆچی بەرهەمێک باشە یان خراپە.\n٣. یارمەتیدان لە دۆزینەوەی بەرهەم لە عەلی بابا بەپێی خواستی بازاڕی عێراق و کوردستان."
 }
 
-# --- HELPER FUNCTIONS ---
-def supabase_request(table, method="GET", data=None, params=None):
+def is_admin(key: str) -> bool:
+    try:
+        valid_main = secrets.compare_digest(key.encode("utf-8"), ADMIN_SECRET.encode("utf-8"))
+        if valid_main: return True
+        if RECOVERY_TOKEN:
+            return secrets.compare_digest(key.encode("utf-8"), RECOVERY_TOKEN.encode("utf-8"))
+        return False
+    except Exception:
+        return False
+
+# --- ASYNC Supabase Request ---
+async def supabase_request(table, method="GET", data=None, params=None):
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     headers = {
         "apikey": SUPABASE_KEY,
@@ -41,239 +73,189 @@ def supabase_request(table, method="GET", data=None, params=None):
         "Prefer": "return=representation"
     }
     try:
-        if method == "GET": resp = requests.get(url, headers=headers, params=params)
-        elif method == "POST": resp = requests.post(url, headers=headers, json=data)
-        elif method == "PATCH": resp = requests.patch(url, headers=headers, json=data, params=params)
-        elif method == "DELETE": resp = requests.delete(url, headers=headers, params=params)
-        return resp.json()
+        async with httpx.AsyncClient() as client:
+            if method == "GET":
+                resp = await client.get(url, headers=headers, params=params, timeout=15.0)
+            elif method == "POST":
+                resp = await client.post(url, headers=headers, json=data, timeout=15.0)
+            elif method == "PATCH":
+                resp = await client.patch(url, headers=headers, json=data, params=params, timeout=15.0)
+            elif method == "DELETE":
+                resp = await client.delete(url, headers=headers, params=params, timeout=15.0)
+            else:
+                return []
+            return resp.json()
     except Exception as e:
         return {"message": str(e)}
 
-# --- MODELS ---
-class AdminAction(BaseModel):
-    admin_key: str
-    id: int = None 
+class AdminAction(BaseModel): admin_key: str; id: int = None
+class AddUserRequest(BaseModel): admin_key: str; username: str; password: str; plan: str = "standard"
+class PlanRequest(BaseModel): admin_key: str; username: str; new_plan: str
+class KnowledgeRequest(BaseModel): admin_key: str; topic: str; content: str; category: str = "brain"
+class BalanceRequest(BaseModel): admin_key: str; username: str; new_balance: int
+class LoginRequest(BaseModel): username: str; password: str
+class PersonaRequest(BaseModel): admin_key: str; expert: str; role_text: str
 
-class AddUserRequest(BaseModel):
-    admin_key: str
-    username: str
-    password: str
-    plan: str = "standard"
-
-class PlanRequest(BaseModel):
-    admin_key: str
-    username: str
-    new_plan: str
-
-class KnowledgeRequest(BaseModel):
-    admin_key: str
-    topic: str
-    content: str
-    category: str = "brain"
-
-class BalanceRequest(BaseModel):
-    admin_key: str
-    username: str
-    new_balance: int
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-class PersonaRequest(BaseModel):
-    admin_key: str
-    expert: str
-    role_text: str
-
-# --- ENDPOINTS ---
 @app.get("/")
-def home():
-    return {"status": "Zirak AI Server Online 🟢"}
+async def home(): return {"status": "Zirak AI Server Online - Admin & User Backend"}
 
 @app.post("/check_auth")
-def check_auth(req: AdminAction):
-    if req.admin_key != ADMIN_SECRET: raise HTTPException(401, "Unauthorized")
+async def check_auth(req: AdminAction):
+    if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
     return {"status": "success"}
 
-# --- USERS MANAGEMENT ---
 @app.post("/get_users")
-def get_users(req: AdminAction):
-    if req.admin_key != ADMIN_SECRET: raise HTTPException(401, "Unauthorized")
-    res = supabase_request("users", "GET", params={"order": "created_at.desc"})
-    if not isinstance(res, list): return []
-    return res
+async def get_users(req: AdminAction):
+    if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
+    res = await supabase_request("users", "GET", params={"order": "created_at.desc"})
+    return res if isinstance(res, list) else []
 
 @app.post("/add_user")
-def add_user(req: AddUserRequest):
-    if req.admin_key != ADMIN_SECRET: raise HTTPException(401, "Unauthorized")
-    check = supabase_request("users", "GET", params={"username": f"eq.{req.username}"})
-    if isinstance(check, list) and len(check) > 0: return {"status": "error", "message": "ئەم ناوە هەیە"}
-    data = {"username": req.username, "password": req.password, "used_tokens": 0, "plan": req.plan}
-    supabase_request("users", "POST", data=data)
+async def add_user(req: AddUserRequest):
+    if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
+    if req.plan not in {"course", "standard", "pro"}: raise HTTPException(400, "Invalid plan")
+    check = await supabase_request("users", "GET", params={"username": f"eq.{req.username}"})
+    if isinstance(check, list) and check: return {"status": "error", "message": "ئەم ناوە هەیە"}
+    await supabase_request("users", "POST", data={"username": req.username, "password": req.password, "used_tokens": 0, "plan": req.plan})
     return {"status": "success"}
 
 @app.post("/update_balance")
-def update_balance(req: BalanceRequest):
-    if req.admin_key != ADMIN_SECRET: raise HTTPException(401, "Unauthorized")
-    supabase_request("users", "PATCH", data={"used_tokens": req.new_balance}, params={"username": f"eq.{req.username}"})
+async def update_balance(req: BalanceRequest):
+    if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
+    await supabase_request("users", "PATCH", data={"used_tokens": req.new_balance}, params={"username": f"eq.{req.username}"})
     return {"status": "success"}
 
 @app.post("/update_plan")
-def update_plan(req: PlanRequest):
-    if req.admin_key != ADMIN_SECRET: raise HTTPException(401, "Unauthorized")
-    supabase_request("users", "PATCH", data={"plan": req.new_plan}, params={"username": f"eq.{req.username}"})
+async def update_plan(req: PlanRequest):
+    if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
+    if req.new_plan not in {"course", "standard", "pro", "locked"}: raise HTTPException(400, "Invalid plan")
+    await supabase_request("users", "PATCH", data={"plan": req.new_plan}, params={"username": f"eq.{req.username}"})
     return {"status": "success"}
 
+@app.post("/lock_user")
+async def lock_user(req: PlanRequest):
+    if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
+    await supabase_request("users", "PATCH", data={"plan": "locked"}, params={"username": f"eq.{req.username}"})
+    return {"status": "success", "message": f"User {req.username} locked"}
+
 @app.post("/delete_user")
-def delete_user(req: BalanceRequest):
-    if req.admin_key != ADMIN_SECRET: raise HTTPException(401, "Unauthorized")
-    supabase_request("users", "DELETE", params={"username": f"eq.{req.username}"})
+async def delete_user(req: BalanceRequest):
+    if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
+    await supabase_request("users", "DELETE", params={"username": f"eq.{req.username}"})
     return {"status": "success"}
 
 @app.post("/login")
-def login(req: LoginRequest):
-    users = supabase_request("users", method="GET", params={"username": f"eq.{req.username.strip()}", "password": f"eq.{req.password.strip()}"})
-    if isinstance(users, list) and len(users) > 0: return {"status": "success", "user": users[0]}
+@limiter.limit("10/minute")
+async def login(request: Request, req: LoginRequest):
+    users = await supabase_request("users", "GET", params={"username": f"eq.{req.username.strip()}", "password": f"eq.{req.password.strip()}"})
+    if isinstance(users, list) and users:
+        user = users[0]
+        if user.get("plan") == "locked": raise HTTPException(status_code=403, detail="ئەم ئەکاونتە قفڵکراوە.")
+        return {"status": "success", "user": user}
     raise HTTPException(status_code=401, detail="هەڵە لە چوونەژوورەوە")
 
-# --- CHAT & LOGS ---
 @app.post("/get_logs")
-def get_logs(req: AdminAction):
-    if req.admin_key != ADMIN_SECRET: raise HTTPException(401, "Unauthorized")
-    res = supabase_request("chat_logs", "GET", params={"order": "created_at.desc", "limit": "50"})
-    if not isinstance(res, list): return []
-    return res
+async def get_logs(req: AdminAction):
+    if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
+    res = await supabase_request("chat_logs", "GET", params={"order": "created_at.desc", "limit": "100"}) # زیادکرا بۆ ١٠٠
+    return res if isinstance(res, list) else []
 
 @app.get("/get_history")
-def get_history(username: str):
-    res = supabase_request("chat_logs", method="GET", params={"username": f"eq.{username}", "order": "created_at.asc"})
-    if not isinstance(res, list): return []
-    return res
+async def get_history(username: str):
+    res = await supabase_request("chat_logs", "GET", params={"username": f"eq.{username}", "order": "created_at.asc"})
+    return res if isinstance(res, list) else []
 
-# --- KNOWLEDGE BASE ---
 @app.post("/add_knowledge")
-def add_knowledge(req: KnowledgeRequest):
-    if req.admin_key != ADMIN_SECRET: raise HTTPException(401, "Unauthorized")
-    data = {"topic": req.topic, "content": req.content, "category": req.category}
-    supabase_request("knowledge_base", "POST", data=data)
+async def add_knowledge(req: KnowledgeRequest):
+    if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
+    await supabase_request("knowledge_base", "POST", data={"topic": req.topic, "content": req.content, "category": req.category})
     return {"status": "success"}
 
 @app.post("/get_knowledge")
-def get_knowledge(req: AdminAction):
-    if req.admin_key != ADMIN_SECRET: raise HTTPException(401, "Unauthorized")
-    res = supabase_request("knowledge_base", "GET", params={"order": "created_at.desc"})
-    if not isinstance(res, list): return []
-    return res
+async def get_knowledge(req: AdminAction):
+    if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
+    res = await supabase_request("knowledge_base", "GET", params={"order": "created_at.desc"})
+    return res if isinstance(res, list) else []
 
 @app.post("/delete_knowledge")
-def delete_knowledge(req: AdminAction):
-    if req.admin_key != ADMIN_SECRET: raise HTTPException(401, "Unauthorized")
-    supabase_request("knowledge_base", "DELETE", params={"id": f"eq.{req.id}"})
+async def delete_knowledge(req: AdminAction):
+    if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
+    await supabase_request("knowledge_base", "DELETE", params={"id": f"eq.{req.id}"})
     return {"status": "success"}
 
-# --- PERSONAS ---
 @app.post("/get_personas")
-def get_personas(req: AdminAction):
-    if req.admin_key != ADMIN_SECRET: raise HTTPException(401, "Unauthorized")
-    
-    # هەوڵدەدات لە داتابەیسەوە بیهێنێت
-    db_personas = supabase_request("personas", "GET")
-    
-    # دروستکردنی فەرهەنگێک لەو کەسایەتییانەی کە لە داتابەیسەکەدا هەن
+async def get_personas(req: AdminAction):
+    if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
+    db_personas = await supabase_request("personas", "GET")
     db_dict = {}
     if isinstance(db_personas, list):
         for p in db_personas:
-            if 'expert' in p and 'role_text' in p:
-                db_dict[p['expert']] = p['role_text']
-    
-    # دروستکردنی لیستەکە بە دڵنیاییەوە (هەردەم ٦ کەسایەتییەکە نیشان دەدات)
+            if "expert" in p and "role_text" in p: db_dict[p["expert"]] = p["role_text"]
     result = []
     for key, text in PROMPTS.items():
-        # ئەگەر لە داتابەیس هەبوو ئەوەیان بهێنە، ئەگەرنا ئەوەی ناو کۆدەکە
-        role_text = db_dict.get(key, text)
-        result.append({"expert": key, "role_text": role_text})
-        
+        result.append({"expert": key, "role_text": db_dict.get(key, text)})
     return result
 
 @app.post("/update_persona")
-def update_persona(req: PersonaRequest):
-    if req.admin_key != ADMIN_SECRET: raise HTTPException(401, "Unauthorized")
-    
-    # سەرەتا بزانە ئەم کەسایەتییە لە داتابەیس هەیە یان نا
-    check = supabase_request("personas", "GET", params={"expert": f"eq.{req.expert}"})
-    
-    if isinstance(check, list) and len(check) > 0:
-        # ئەگەر هەبوو، تەنها ئەپدەیت (PATCH)ی بکە
-        res = supabase_request("personas", "PATCH", data={"role_text": req.role_text}, params={"expert": f"eq.{req.expert}"})
+async def update_persona(req: PersonaRequest):
+    if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
+    if req.expert not in ALLOWED_EXPERTS: raise HTTPException(400, "Invalid expert key")
+    check = await supabase_request("personas", "GET", params={"expert": f"eq.{req.expert}"})
+    if isinstance(check, list) and check:
+        res = await supabase_request("personas", "PATCH", data={"role_text": req.role_text}, params={"expert": f"eq.{req.expert}"})
     else:
-        # ئەگەر نەبوو، زیادی بکە (POST)
-        res = supabase_request("personas", "POST", data={"expert": req.expert, "role_text": req.role_text})
-    
-    # پێداچوونەوە بۆ هەڵەی داتابەیس (وەک ئەوەی خشتەکە دروست نەکرابێت)
-    if isinstance(res, dict) and (res.get("code") or res.get("message")):
-        raise HTTPException(status_code=500, detail=f"کێشەی داتابەیس: پێویستە خشتەی personas دروست بکەیت لە Supabase. کێشە: {res.get('message', '')}")
-        
+        res = await supabase_request("personas", "POST", data={"expert": req.expert, "role_text": req.role_text})
     return {"status": "success"}
 
-# --- CHAT LOGIC ---
 @app.post("/chat")
-def chat_endpoint(
-    prompt: str = Form(...), expert: str = Form(...), username: str = Form(...),
-    history: str = Form("[]"), image_url: str = Form(None)
+@limiter.limit("15/minute")
+async def chat_endpoint(
+    request: Request, prompt: str = Form(...), expert: str = Form(...), username: str = Form(...), history: str = Form("[]"), image_url: str = Form(None)
 ):
+    if expert not in ALLOWED_EXPERTS: raise HTTPException(400, "Invalid expert")
     current_balance = 0
-    u = supabase_request("users", "GET", params={"username": f"eq.{username}"})
-    if isinstance(u, list) and u: current_balance = u[0].get('used_tokens', 0)
+    u = await supabase_request("users", "GET", params={"username": f"eq.{username}"})
+    if isinstance(u, list) and u:
+        if u[0].get("plan") == "locked": raise HTTPException(403, "Account locked")
+        current_balance = u[0].get("used_tokens", 0)
 
-    # Get Persona
     system_instruction = PROMPTS.get(expert, PROMPTS["brain"])
     try:
-        # Check DB for custom persona
-        p_db = supabase_request("personas", "GET", params={"expert": f"eq.{expert}"})
-        if isinstance(p_db, list) and len(p_db) > 0 and p_db[0].get('role_text'):
-            system_instruction = p_db[0]['role_text']
-    except: pass
+        p_db = await supabase_request("personas", "GET", params={"expert": f"eq.{expert}"})
+        if isinstance(p_db, list) and p_db and p_db[0].get("role_text"): system_instruction = p_db[0]["role_text"]
+    except Exception: pass
 
-    # RAG Logic (Simple)
-    knowledge = ""
     if expert == "brain":
-        kb = supabase_request("knowledge_base", "GET")
-        if isinstance(kb, list):
-            for k in kb: knowledge += f"\n- {k['topic']}: {k['content']}"
-    
-    if knowledge:
-        system_instruction += f"\n\n[OFFICIAL KNOWLEDGE BASE]:\n{knowledge}\nUse this info to answer if relevant."
+        kb = await supabase_request("knowledge_base", "GET")
+        if isinstance(kb, list) and kb:
+            knowledge_lines = "\n".join(f"- {k.get('topic','')}: {k.get('content','')}" for k in kb)
+            system_instruction += f"\n\n[OFFICIAL KNOWLEDGE BASE — MUST FOLLOW]:\n{knowledge_lines}\nYou MUST use this information."
+
+    system_instruction += "\n\n[OUTPUT RULES]: Format professionally using Markdown. Respond in user's language."
 
     messages = [{"role": "system", "content": system_instruction}]
     try:
-        hist_list = json.loads(history)
-        for msg in hist_list: messages.append({"role": "user" if msg['role'] == 'user' else "assistant", "content": msg['text']})
-    except: pass
-    
+        db_history = await supabase_request("chat_logs", "GET", params={"username": f"eq.{username}", "expert": f"eq.{expert}", "order": "created_at.asc", "limit": "20"})
+        if isinstance(db_history, list) and db_history:
+            for log in db_history:
+                if log.get("user_message"): messages.append({"role": "user", "content": log["user_message"]})
+                if log.get("ai_response"): messages.append({"role": "assistant", "content": log["ai_response"]})
+        else:
+            for msg in json.loads(history):
+                messages.append({"role": "user" if msg.get("role") == "user" else "assistant", "content": msg.get("text", "")})
+    except Exception: pass
     messages.append({"role": "user", "content": prompt})
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://zirak-pro.netlify.app", 
-        "X-Title": "Zirak Pro"
-    }
-    data = {"model": GEMINI_MODEL, "messages": messages}
-    
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json", "HTTP-Referer": "https://zirak-pro.netlify.app", "X-Title": "Zirak Pro"}
     try:
-        res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data)
-        ai_text = res.json()['choices'][0]['message']['content']
-        
-        new_tokens = len(prompt) + len(ai_text)
-        total_used = current_balance + new_tokens
-        
-        supabase_request("chat_logs", "POST", data={"username": username, "expert": expert, "user_message": prompt, "ai_response": ai_text})
-        supabase_request("users", "PATCH", data={"used_tokens": total_used}, params={"username": f"eq.{username}"})
-        
+        async with httpx.AsyncClient() as client:
+            res = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json={"model": GEMINI_MODEL, "messages": messages}, timeout=60.0)
+        res_json = res.json()
+        ai_text = res_json["choices"][0]["message"]["content"]
+
+        total_used = current_balance + len(prompt) + len(ai_text)
+        await supabase_request("chat_logs", "POST", data={"username": username, "expert": expert, "user_message": prompt, "ai_response": ai_text})
+        await supabase_request("users", "PATCH", data={"used_tokens": total_used}, params={"username": f"eq.{username}"})
         return {"response": ai_text, "new_balance": total_used}
     except Exception as e:
-        return {"response": f"Error: {str(e)}", "new_balance": current_balance}
-
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    return {"url": "disabled_for_now"}
+        return {"response": "کێشەی سێرڤەر. تکایە دووبارە هەوڵ بدە.", "new_balance": current_balance}
