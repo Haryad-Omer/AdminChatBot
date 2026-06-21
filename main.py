@@ -104,6 +104,37 @@ async def check_auth(req: AdminAction):
     if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
     return {"status": "success"}
 
+# --- NEW: Get Real API Stats from OpenRouter ---
+@app.post("/get_system_stats")
+async def get_system_stats(req: AdminAction):
+    if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
+    
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}"
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            # پەیوەندی کردن بە OpenRouter بۆ هێنانەوەی باڵانسی ڕاستەقینەی کلیلەکە
+            res = await client.get("https://openrouter.ai/api/v1/auth/key", headers=headers, timeout=10.0)
+            data = res.json()
+            
+            if "data" in data:
+                usage_cost = data["data"].get("usage", 0.0) # تێچوو بە دۆلار
+                limit = data["data"].get("limit", 0.0)
+                
+                # خەمڵاندنی ژمارەی تۆکنەکان لەسەر بنەمای ئەوەی کە فلاش ٠.٤٠ دۆلارە بۆ هەر ملیۆنێک
+                estimated_total_tokens = int((usage_cost / 0.40) * 1000000) if usage_cost > 0 else 0
+                
+                return {
+                    "status": "success", 
+                    "cost": usage_cost, 
+                    "limit": limit, 
+                    "estimated_tokens": estimated_total_tokens
+                }
+            return {"status": "error", "message": "Could not parse OpenRouter response"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @app.post("/get_users")
 async def get_users(req: AdminAction):
     if not is_admin(req.admin_key): raise HTTPException(401, "Unauthorized")
